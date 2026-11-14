@@ -983,8 +983,8 @@ fn generate_module(
         "// Generated automatically by iced_lucide at build time.\n\
          // Do not edit manually.\n\
          // {hash}\n\
-         use iced::{{Font, font}};\n\
-         use iced::widget::text::{{self, Text}};\n\n\
+         use iced::widget::text::{{self, Text}};\n\
+         use iced::{{Font, font}};\n\n\
          pub const FONT: &[u8] = include_bytes!({ttf_path:?});\n\n"
     ));
 
