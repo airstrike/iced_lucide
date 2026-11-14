@@ -1,7 +1,7 @@
 #![allow(clippy::needless_doctest_main)]
 //! A compile-time, type-safe [Lucide] icon font library for [`iced`].
 //!
-//! Parses Lucide's `unicode.html` at build time — no network calls required.
+//! Generates subsets from the bundled Lucide font or a local font and matching name index.
 //!
 //! [`iced`]: https://github.com/iced-rs/iced
 //! [Lucide]: https://lucide.dev
@@ -35,12 +35,16 @@
 //!
 //! ```rust,no_run
 //! pub fn main() {
-//!     println!("cargo::rerun-if-changed=fonts/my-icons.toml");
 //!     iced_lucide::build("fonts/my-icons.toml").expect("Build icon module");
 //! }
 //! ```
 //!
-//! This generates `src/icon.rs` and copies `lucide.ttf` next to your TOML.
+//! This generates `src/icon.rs` and writes the subsetted `lucide.ttf` next to your TOML.
+//!
+//! To pin another Lucide release, add a `[source]` table to the same definition with
+//! `ttf` and `index` paths relative to the consuming crate root. Use a matching
+//! `font/lucide.ttf` and `font/unicode.html` (or numeric `font/codepoints.json`).
+//! Omitting the table uses the bundled release. Cargo tracks changes to both inputs.
 //!
 //! ## Custom output paths
 //!
@@ -108,6 +112,7 @@
 
 use serde::Deserialize;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
@@ -131,67 +136,26 @@ const UNICODE_HTML: &str = include_str!("../assets/unicode.html");
 
 /// Build a type-safe icon module from a TOML definition file.
 ///
-/// Reads the font definition, validates every requested icon name against
-/// Lucide's icon set, copies `lucide.ttf` next to the TOML, and generates
+/// Validates requested icons against the configured or bundled font and index,
+/// writes the subset font next to the TOML by default, and generates
 /// `src/{module}.rs`.
 ///
 /// Call this from your `build.rs`:
 ///
 /// ```rust,no_run
 /// pub fn main() {
-///     println!("cargo::rerun-if-changed=fonts/my-icons.toml");
 ///     iced_lucide::build("fonts/my-icons.toml").expect("Build icon module");
 /// }
 /// ```
 pub fn build(path: impl AsRef<Path>) -> Result<(), Error> {
     let path = path.as_ref();
 
-    let definition: Definition = {
-        let contents = fs::read_to_string(path).unwrap_or_else(|error| {
-            panic!(
-                "Icon definition {path} could not be read: {error}",
-                path = path.display()
-            )
-        });
-
-        toml::from_str(&contents).unwrap_or_else(|error| {
-            panic!(
-                "Icon definition {path} is invalid: {error}",
-                path = path.display()
-            )
-        })
-    };
-
-    let all = parse_icons();
-
-    let icons: BTreeMap<String, u32> = definition
-        .icons
-        .into_iter()
-        .map(|(fn_name, icon_name)| {
-            let Some(&code) = all.get(&icon_name) else {
-                let candidates: Vec<_> = all
-                    .keys()
-                    .filter(|k| k.contains(icon_name.split('-').next().unwrap_or("")))
-                    .take(5)
-                    .map(String::as_str)
-                    .collect();
-
-                let hint = if candidates.is_empty() {
-                    String::new()
-                } else {
-                    format!("\nSimilar icons: {}", candidates.join(", "))
-                };
-
-                panic!(
-                    "Lucide icon \"{icon_name}\" was not found.\
-                    \nBrowse all icons at https://lucide.dev/icons{hint}"
-                );
-            };
-            (fn_name, code)
-        })
-        .collect();
-
-    let hash = compute_hash(&icons, definition.family.as_deref());
+    println!("cargo::rerun-if-changed={}", path.display());
+    let contents = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
+    let definition: Definition = toml::from_str(&contents).map_err(|err| Error::Definition {
+        path: path.to_owned(),
+        detail: err.to_string(),
+    })?;
 
     // Resolve the destination for the generated `.rs` module. A custom
     // `module_target` wins over the historical `src/<module>.rs` default.
@@ -218,39 +182,91 @@ pub fn build(path: impl AsRef<Path>) -> Result<(), Error> {
     // emit a correct `../..`-prefixed include path regardless of how deep
     // either destination is nested.
     let module_dir = module_target.parent().unwrap_or_else(|| Path::new(""));
-    let ttf_rel = relative_from(module_dir, &ttf_target);
+    let ttf_rel = relative_from(module_dir, &ttf_target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let (font, index, font_path, index_path) = match &definition.source {
+        Some(source) => {
+            for input in [&source.ttf, &source.index] {
+                println!("cargo::rerun-if-changed={}", input.display());
+                let resolved = fs::canonicalize(input).map_err(|err| Error::io(input, err))?;
+                for target in [&module_target, &ttf_target] {
+                    if fs::canonicalize(target).is_ok_and(|path| path == resolved) {
+                        return Err(Error::OutputOverwritesSource(target.clone()));
+                    }
+                }
+            }
+            let font = fs::read(&source.ttf).map_err(|err| Error::io(&source.ttf, err))?;
+            let index =
+                fs::read_to_string(&source.index).map_err(|err| Error::io(&source.index, err))?;
+            (
+                Cow::Owned(font),
+                Cow::Owned(index),
+                source.ttf.as_path(),
+                source.index.as_path(),
+            )
+        }
+        None => (
+            Cow::Borrowed(FONT_BYTES),
+            Cow::Borrowed(UNICODE_HTML),
+            Path::new("bundled lucide.ttf"),
+            Path::new("bundled unicode.html"),
+        ),
+    };
+    let all = parse_index(&index, index_path)?;
+    let face = ttf_parser::Face::parse(&font, 0).map_err(|err| Error::Font {
+        path: font_path.to_owned(),
+        detail: err.to_string(),
+    })?;
+    let mut icons = BTreeMap::new();
+    for (alias, name) in definition.icons {
+        let code = *all.get(&name).ok_or_else(|| Error::UnknownIcon {
+            alias: alias.clone(),
+            name: name.clone(),
+            index: index_path.to_owned(),
+        })?;
+        if char::from_u32(code)
+            .and_then(|ch| face.glyph_index(ch))
+            .is_none_or(|id| id.0 == 0)
+        {
+            return Err(Error::MissingGlyph {
+                alias,
+                name,
+                code,
+                index: index_path.to_owned(),
+                font: font_path.to_owned(),
+            });
+        }
+        icons.insert(alias, code);
+    }
+    let hash = compute_hash(
+        &icons,
+        definition.family.as_deref(),
+        &font,
+        &index,
+        &ttf_rel,
+    );
 
+    let module = generate_module(&icons, &hash, ttf_rel, definition.family.as_deref());
     let existing = fs::read_to_string(&module_target).unwrap_or_default();
-    let existing_hash = existing
-        .lines()
-        .nth(2)
-        .unwrap_or_default()
-        .trim_start_matches("// ");
-
-    if hash != existing_hash || !ttf_target.exists() {
+    if existing != module || !ttf_target.exists() {
         // Build a subset TTF with only the requested glyphs
         let codepoints: Vec<u32> = icons.values().copied().collect();
-        let font_data = subset_font(&codepoints, definition.family.as_deref());
+        let font_data = subset_font(&font, &face, &codepoints, definition.family.as_deref())
+            .map_err(|err| Error::Font {
+                path: font_path.to_owned(),
+                detail: err.to_string(),
+            })?;
 
         if let Some(dir) = ttf_target.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(dir)
-                .unwrap_or_else(|e| panic!("Create TTF directory {}: {e}", dir.display()));
+            fs::create_dir_all(dir).map_err(|err| Error::io(dir, err))?;
         }
-        fs::write(&ttf_target, &font_data)
-            .unwrap_or_else(|e| panic!("Write lucide.ttf to {}: {e}", ttf_target.display()));
-
-        let module = generate_module(
-            &icons,
-            &hash,
-            ttf_rel.to_string_lossy().replace('\\', "/"),
-            definition.family.as_deref(),
-        );
+        fs::write(&ttf_target, &font_data).map_err(|err| Error::io(&ttf_target, err))?;
 
         if let Some(dir) = module_target.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(dir)
-                .unwrap_or_else(|e| panic!("Create module directory {}: {e}", dir.display()));
+            fs::create_dir_all(dir).map_err(|err| Error::io(dir, err))?;
         }
-        fs::write(&module_target, module).expect("Write icon module");
+        fs::write(&module_target, module).map_err(|err| Error::io(&module_target, err))?;
     }
 
     Ok(())
@@ -336,12 +352,10 @@ fn relative_from(base: &Path, target: &Path) -> PathBuf {
 ///   use in picker widgets
 /// - One typed function per icon, e.g. `pub fn pencil<'a>() -> Text<'a>`
 pub fn build_all(module_name: &str) -> Result<(), Error> {
-    let all_icons: BTreeMap<String, u32> = parse_icons()
+    let all_icons: BTreeMap<String, u32> = parse_icons(UNICODE_HTML)
         .into_iter()
         .map(|(name, code)| (sanitize_fn_name(&name), code))
         .collect();
-
-    let hash = compute_hash(&all_icons, None);
 
     let module_depth = module_name.split("::").count();
     let module_target = PathBuf::from("src")
@@ -360,29 +374,22 @@ pub fn build_all(module_name: &str) -> Result<(), Error> {
     let ttf_dir = PathBuf::from("fonts");
     fs::create_dir_all(&ttf_dir).expect("Create fonts directory");
     let ttf_target = ttf_dir.join("lucide.ttf");
-    let ttf_rel = rel_root.join(&ttf_target);
+    println!("cargo::rerun-if-changed={}", ttf_target.display());
+    let ttf_rel = rel_root
+        .join(&ttf_target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let hash = compute_hash(&all_icons, None, FONT_BYTES, UNICODE_HTML, &ttf_rel);
 
+    let module = generate_module(&all_icons, &hash, ttf_rel, None);
     let existing = fs::read_to_string(&module_target).unwrap_or_default();
-    let existing_hash = existing
-        .lines()
-        .nth(2)
-        .unwrap_or_default()
-        .trim_start_matches("// ");
-
-    if hash != existing_hash || !ttf_target.exists() {
+    if existing != module || !ttf_target.exists() {
         fs::write(&ttf_target, FONT_BYTES).unwrap_or_else(|e| panic!("Write lucide.ttf: {e}"));
-
-        let module = generate_module(
-            &all_icons,
-            &hash,
-            ttf_rel.to_string_lossy().replace('\\', "/"),
-            None,
-        );
 
         if let Some(dir) = module_target.parent() {
             fs::create_dir_all(dir).expect("Create src directory");
         }
-        fs::write(&module_target, module).expect("Write icon module");
+        fs::write(&module_target, module).map_err(|err| Error::io(&module_target, err))?;
     }
 
     Ok(())
@@ -403,7 +410,7 @@ pub fn build_all(module_name: &str) -> Result<(), Error> {
 /// }
 /// ```
 pub fn icons() -> Vec<(String, u32)> {
-    let mut list: Vec<(String, u32)> = parse_icons().into_iter().collect();
+    let mut list: Vec<(String, u32)> = parse_icons(UNICODE_HTML).into_iter().collect();
     list.sort_by(|a, b| a.0.cmp(&b.0));
     list
 }
@@ -412,8 +419,45 @@ pub fn icons() -> Vec<(String, u32)> {
 // Error type
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-pub enum Error {}
+/// A definition, source font, index, or output that could not be used.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{path}: {detail}")]
+    Io { path: PathBuf, detail: String },
+    #[error("Invalid icon definition {path}: {detail}")]
+    Definition { path: PathBuf, detail: String },
+    #[error("Invalid Lucide name index {path}: {detail}")]
+    Index { path: PathBuf, detail: String },
+    #[error("Invalid Lucide font {path}: {detail}")]
+    Font { path: PathBuf, detail: String },
+    #[error("Icon {name:?} (requested as {alias:?}) was not found in {index}")]
+    UnknownIcon {
+        alias: String,
+        name: String,
+        index: PathBuf,
+    },
+    #[error(
+        "Icon {name:?} (requested as {alias:?}) maps to U+{code:04X} in {index}, but {font} has no glyph there. Use an index and font from the same Lucide release and select an encoded icon."
+    )]
+    MissingGlyph {
+        alias: String,
+        name: String,
+        code: u32,
+        index: PathBuf,
+        font: PathBuf,
+    },
+    #[error("Output {0} would overwrite a configured source file. Set a separate output path.")]
+    OutputOverwritesSource(PathBuf),
+}
+
+impl Error {
+    fn io(path: &Path, error: std::io::Error) -> Self {
+        Self::Io {
+            path: path.to_owned(),
+            detail: error.to_string(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -458,7 +502,33 @@ struct Definition {
     /// shadowed one renders as tofu).
     #[serde(default)]
     family: Option<String>,
+    source: Option<Source>,
     icons: BTreeMap<String, String>,
+}
+
+/// Two files from the same lucide-static release, relative to the crate root.
+#[derive(Clone, Debug, Deserialize)]
+struct Source {
+    ttf: PathBuf,
+    index: PathBuf,
+}
+
+fn parse_index(index: &str, index_path: &Path) -> Result<HashMap<String, u32>, Error> {
+    if index.trim_start().starts_with('<') {
+        let names = parse_icons(index);
+        if names.is_empty() {
+            return Err(Error::Index {
+                path: index_path.to_owned(),
+                detail: "expected entries from Lucide's font/unicode.html".into(),
+            });
+        }
+        Ok(names)
+    } else {
+        serde_json::from_str(index).map_err(|err| Error::Index {
+            path: index_path.to_owned(),
+            detail: err.to_string(),
+        })
+    }
 }
 
 /// Parse `unicode.html` into a map of `icon-name → unicode codepoint`.
@@ -467,9 +537,9 @@ struct Definition {
 /// ```html
 /// <h4>pencil</h4><span class="unicode">&amp;#57347;</span>
 /// ```
-fn parse_icons() -> HashMap<String, u32> {
+fn parse_icons(html: &str) -> HashMap<String, u32> {
     let mut map = HashMap::new();
-    let mut remaining = UNICODE_HTML;
+    let mut remaining = html;
 
     while let Some(h4_start) = remaining.find("<h4>") {
         remaining = &remaining[h4_start + 4..];
@@ -509,9 +579,12 @@ fn parse_icons() -> HashMap<String, u32> {
 /// the byte layout. When `family = None`, the upstream Lucide font's name
 /// table is preserved verbatim so the Lucide license metadata is carried
 /// over into the subset.
-fn subset_font(codepoints: &[u32], family: Option<&str>) -> Vec<u8> {
-    let face = ttf_parser::Face::parse(FONT_BYTES, 0).expect("Parse bundled lucide.ttf");
-
+fn subset_font(
+    font: &[u8],
+    face: &ttf_parser::Face<'_>,
+    codepoints: &[u32],
+    family: Option<&str>,
+) -> Result<Vec<u8>, subsetter::Error> {
     // GlyphRemapper::new() already includes .notdef (glyph 0).
     let mut remapper = subsetter::GlyphRemapper::new();
     let mut cp_to_old_gid: Vec<(u32, u16)> = Vec::new();
@@ -526,10 +599,7 @@ fn subset_font(codepoints: &[u32], family: Option<&str>) -> Vec<u8> {
     }
 
     // Subset strips unused outlines and removes the cmap table.
-    let subset_data = match subsetter::subset(FONT_BYTES, 0, &remapper) {
-        Ok(data) => data,
-        Err(_) => return FONT_BYTES.to_vec(),
-    };
+    let subset_data = subsetter::subset(font, 0, &remapper)?;
 
     // Translate codepoints to their new (remapped) glyph IDs.
     let mut cp_to_new_gid: Vec<(u32, u16)> = cp_to_old_gid
@@ -549,13 +619,13 @@ fn subset_font(codepoints: &[u32], family: Option<&str>) -> Vec<u8> {
         Some(family) => build_name_table(family),
         // No custom family: preserve the original name table so Lucide's
         // license metadata is carried over (subsetter removes it).
-        None => match extract_table(FONT_BYTES, b"name") {
+        None => match extract_table(font, b"name") {
             Some(data) => data,
-            None => return with_cmap,
+            None => return Ok(with_cmap),
         },
     };
 
-    inject_table(&with_cmap, b"name", &name_data)
+    Ok(inject_table(&with_cmap, b"name", &name_data))
 }
 
 /// Build a minimal OpenType `name` table (format 0) with four records:
@@ -867,16 +937,21 @@ fn sanitize_fn_name(name: &str) -> String {
     s
 }
 
-/// SHA-256 hash of the sorted icon list and family name, returned as
-/// a hex string.
-///
-/// `family` participates in the hash so that flipping or renaming the
-/// custom family in the TOML invalidates the cached generated module
-/// and TTF. Without it, a build that only changes `family` would skip
-/// regeneration and ship a TTF with the old `name` table.
-fn compute_hash(icons: &BTreeMap<String, u32>, family: Option<&str>) -> String {
+/// Fingerprint the source pair, Rust aliases, family and generated font location.
+fn compute_hash(
+    icons: &BTreeMap<String, u32>,
+    family: Option<&str>,
+    font: &[u8],
+    index: &str,
+    include_path: &str,
+) -> String {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
+    // Font outlines can change while both the names and codepoints stay put.
+    for input in [font, index.as_bytes(), include_path.as_bytes()] {
+        hasher.update((input.len() as u64).to_le_bytes());
+        hasher.update(input);
+    }
     for (name, code) in icons {
         hasher.update(name.as_bytes());
         hasher.update(b":");
@@ -908,8 +983,9 @@ fn generate_module(
         "// Generated automatically by iced_lucide at build time.\n\
          // Do not edit manually.\n\
          // {hash}\n\
+         use iced::{{Font, font}};\n\
          use iced::widget::text::{{self, Text}};\n\n\
-         pub const FONT: &[u8] = include_bytes!(\"{ttf_path}\");\n\n"
+         pub const FONT: &[u8] = include_bytes!({ttf_path:?});\n\n"
     ));
 
     // Static slice of (name, codepoint_str) for icon pickers
@@ -944,7 +1020,7 @@ fn generate_module(
          /// ```\n\
          pub fn render<'a, Theme>(codepoint: &'a str) -> Text<'a, Theme>\n\
          where\n    Theme: text::Catalog + 'a,\n\
-         {{\n    Text::new(codepoint).font(\"{family_literal}\")\n}}\n\n"
+         {{\n    Text::new(codepoint).font(Font {{\n        family: font::Family::Name({family_literal:?}),\n        ..Font::DEFAULT\n    }})\n}}\n\n"
     ));
 
     // Private helper used by typed icon functions
@@ -967,7 +1043,7 @@ mod tests {
 
     #[test]
     fn parses_icons() {
-        let icons = parse_icons();
+        let icons = parse_icons(UNICODE_HTML);
         assert!(!icons.is_empty(), "should find at least one icon");
         assert!(icons.contains_key("pencil"), "should contain 'pencil'");
         assert!(icons.contains_key("trash-2"), "should contain 'trash-2'");
@@ -976,7 +1052,7 @@ mod tests {
 
     #[test]
     fn icon_count_reasonable() {
-        let icons = parse_icons();
+        let icons = parse_icons(UNICODE_HTML);
         assert!(
             icons.len() > 1000,
             "expected >1000 icons, got {}",
@@ -999,17 +1075,29 @@ mod tests {
         let mut icons = BTreeMap::new();
         icons.insert("edit".to_string(), 0xE001u32);
         icons.insert("save".to_string(), 0xE002u32);
-        let h1 = compute_hash(&icons, None);
-        let h2 = compute_hash(&icons, None);
+        let h1 = compute_hash(&icons, None, FONT_BYTES, UNICODE_HTML, "lucide.ttf");
+        let h2 = compute_hash(&icons, None, FONT_BYTES, UNICODE_HTML, "lucide.ttf");
         assert_eq!(h1, h2);
 
         // Family participates: distinct family → distinct hash.
-        let h_default = compute_hash(&icons, None);
-        let h_custom = compute_hash(&icons, Some("granita-lucide"));
+        let h_default = compute_hash(&icons, None, FONT_BYTES, UNICODE_HTML, "lucide.ttf");
+        let h_custom = compute_hash(
+            &icons,
+            Some("granita-lucide"),
+            FONT_BYTES,
+            UNICODE_HTML,
+            "lucide.ttf",
+        );
         assert_ne!(h_default, h_custom);
 
         // Same family → stable hash.
-        let h_custom2 = compute_hash(&icons, Some("granita-lucide"));
+        let h_custom2 = compute_hash(
+            &icons,
+            Some("granita-lucide"),
+            FONT_BYTES,
+            UNICODE_HTML,
+            "lucide.ttf",
+        );
         assert_eq!(h_custom, h_custom2);
     }
 
@@ -1140,7 +1228,8 @@ mod tests {
     fn subset_is_smaller_and_valid() {
         // A handful of icons — far fewer than the full 1685.
         let codepoints = [0xE001, 0xE002, 0xE003, 0xE004, 0xE005];
-        let subsetted = subset_font(&codepoints, None);
+        let face = ttf_parser::Face::parse(FONT_BYTES, 0).unwrap();
+        let subsetted = subset_font(FONT_BYTES, &face, &codepoints, None).unwrap();
 
         // Must be smaller than the full font.
         assert!(
@@ -1173,7 +1262,8 @@ mod tests {
     #[test]
     fn subset_with_custom_family_writes_name_table() {
         let codepoints = [0xE001, 0xE002, 0xE003];
-        let subsetted = subset_font(&codepoints, Some("test-fam"));
+        let face = ttf_parser::Face::parse(FONT_BYTES, 0).unwrap();
+        let subsetted = subset_font(FONT_BYTES, &face, &codepoints, Some("test-fam")).unwrap();
 
         let face = ttf_parser::Face::parse(&subsetted, 0)
             .expect("ttf-parser parses subset with custom family");

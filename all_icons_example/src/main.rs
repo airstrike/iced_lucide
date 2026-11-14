@@ -1,3 +1,4 @@
+#[allow(dead_code)] // The picker uses the generated name index instead of typed helpers.
 mod icon;
 
 use iced::widget::{button, container, scrollable, text, tooltip, Row};

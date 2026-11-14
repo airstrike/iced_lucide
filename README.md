@@ -25,19 +25,41 @@ Add `iced_lucide` to your `build-dependencies`:
 
 ```toml
 [build-dependencies]
-iced_lucide = { git = "https://github.com/A-Disruption/iced_lucide" }
+iced_lucide = { git = "https://github.com/airstrike/iced_lucide" }
 ```
 
 Call `build` in your `build.rs`:
 
 ```rust
 pub fn main() {
-    println!("cargo::rerun-if-changed=fonts/my-icons.toml");
     iced_lucide::build("fonts/my-icons.toml").expect("Build icon module");
 }
 ```
 
-This generates `src/icon.rs` and copies `lucide.ttf` next to your TOML.
+This generates `src/icon.rs` and writes a subset font named `lucide.ttf` next to your TOML.
+
+### Choose a Lucide release
+
+The bundled font and name index come from [lucide-static 1.72.0](assets/README.md). To use another release, keep its matching TTF, name index and license together in your crate. Point the same build script at this definition:
+
+```toml
+# fonts/my-icons.toml
+module = "icon"
+
+[source]
+ttf = "vendor/lucide-static-0.575.0/font/lucide.ttf"
+index = "vendor/lucide-static-0.575.0/font/unicode.html"
+
+[icons]
+chat = "message-circle-dashed"
+github = "github"
+```
+
+Paths in `[source]` are relative to the consuming crate root, like `module_target` and `ttf_target`. Keep input files separate from the generated subset. Use either the release’s `font/unicode.html` or its numeric `font/codepoints.json` when available. The HTML index lists drawable icons. Some JSON indices include removed names whose codepoints have no corresponding glyph. Requesting one produces a build error identifying the name and codepoint.
+
+Lucide sometimes changes an outline, renames an icon, or removes a glyph such as `github`. Pinning the matching files restores the artwork and names for that release. Rust function names remain your choice under `[icons]`. Cargo tracks the definition and both source files. Changing outlines regenerates your subset even when the codepoints stay the same.
+
+`build_all`, `icons()` and `FONT_BYTES` use the bundled release.
 
 ### Custom output paths
 
@@ -119,21 +141,13 @@ for (name, codepoint) in iced_lucide::icons() {
 
 ## Updating Lucide
 
-Both the TTF and the icon map are bundled in `assets/`. To update to a newer
-Lucide release, replace both files together and rebuild:
-
-```bash
-curl -L -o assets/lucide.ttf   https://cdn.jsdelivr.net/npm/lucide-static/font/lucide.ttf
-curl -L -o assets/unicode.html https://cdn.jsdelivr.net/npm/lucide-static/font/unicode.html
-```
-
-The hash-based cache in the build script detects the change and regenerates
-your icon module automatically.
+For maintainers, the [bundled asset provenance](assets/README.md) records the pinned release and update procedure.
 
 ## Example
 
-See the [`example`](example) directory for a full working application.
+Run the [subset example](subset_example) or the [all-icons picker](all_icons_example):
 
-```
-cargo run --manifest-path example/Cargo.toml
+```sh
+cargo run -p subset_example
+cargo run -p all_icons_example
 ```
